@@ -227,6 +227,32 @@ def filter_bot_comments(
     return [c for c in comments if not any(s in c.get("body", "") for s in sentinel_phrases)]
 
 
+def check_description_editors(
+    editors: list[str],
+    reporter_email: str,
+    internal_domain_re: re.Pattern[str],
+) -> list[str]:
+    """Check if any description editors are outside the trusted domain.
+
+    Validates the reporter (original author) and all changelog editors.
+    Returns a list of untrusted email addresses (empty means all clear).
+    Treats empty or missing emails as untrusted.
+    """
+    untrusted: list[str] = []
+    if not reporter_email:
+        untrusted.append("missing-email:reporter")
+    elif not internal_domain_re.search(reporter_email):
+        untrusted.append(reporter_email)
+
+    for email in editors:
+        normalized = email or "missing-email:unknown"
+        if normalized.startswith("missing-email:") or not internal_domain_re.search(normalized):
+            if normalized not in untrusted:
+                untrusted.append(normalized)
+
+    return untrusted
+
+
 def check_external_reporter(
     ticket: dict,
     internal_domain_re: re.Pattern[str],
@@ -304,8 +330,49 @@ def _run_gitleaks(workdir: str, **_kw: object) -> list[str]:
     return gitleaks_scan(Path(workdir))
 
 
+def _run_description_editors(**_kw: object) -> list[str]:
+    """CLI runner for the description-editors gate."""
+    from agentic_ci.jira.client import JiraClient
+
+    ticket_key = os.environ.get("TICKET_KEY", "")
+    if not ticket_key:
+        return ["TICKET_KEY env var not set; cannot check description editors"]
+
+    jira_url = os.environ.get("JIRA_URL", "https://redhat.atlassian.net")
+    try:
+        client = JiraClient.from_env(url=jira_url)
+    except Exception as exc:
+        return [f"Could not create Jira client: {exc}"]
+
+    try:
+        issue = client.get_issue(ticket_key)
+    except Exception as exc:
+        return [f"Could not fetch issue {ticket_key}: {exc}"]
+
+    reporter_email = issue.get("reporter_email", "")
+    try:
+        editors = client.get_description_editors(ticket_key)
+    except Exception as exc:
+        return [f"Could not fetch changelog for {ticket_key}: {exc}"]
+
+    internal_re = re.compile(r"@redhat\.com$", re.IGNORECASE)
+    untrusted = check_description_editors(editors, reporter_email, internal_re)
+    if untrusted:
+        return [
+            f"Description edited by untrusted user(s): {', '.join(untrusted)}. "
+            "Only @redhat.com users may author or edit the ticket description."
+        ]
+    return []
+
+
 # -- Register built-in gates -------------------------------------------------
 
 _register("sensitive-files", _run_sensitive_files, phase="post")
 _register("commit-author", _run_commit_author, phase="post", required_env=["BOT_EMAIL"])
 _register("gitleaks", _run_gitleaks, phase="post")
+_register(
+    "description-editors",
+    _run_description_editors,
+    phase="pre",
+    required_env=["JIRA_EMAIL", "JIRA_API_TOKEN", "TICKET_KEY"],
+)
